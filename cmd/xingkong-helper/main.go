@@ -21,7 +21,7 @@ import (
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.4"
+	version          = "0.1.5"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
@@ -68,7 +68,7 @@ type execResponse struct {
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
-	origins := flag.String("origins", "https://new.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
+	origins := flag.String("origins", "https://new.xingkongai.online,https://test.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
 
@@ -123,6 +123,7 @@ func main() {
 
 	log.Printf("%s %s listening on http://%s", appName, version, *addr)
 	log.Printf("workspace: %s", root)
+	log.Printf("allowed origins: %s", strings.Join(s.allowedOrigins, ", "))
 	if s.workspaceWarn != "" {
 		log.Printf("warning: %s", s.workspaceWarn)
 		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\"")
