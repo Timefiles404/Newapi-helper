@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,17 +69,24 @@ func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
 	origins := flag.String("origins", "https://new.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
+	installProtocol := flag.Bool("install-protocol", runtime.GOOS == "windows", "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
 
 	workspaceValue := strings.TrimSpace(*workspace)
+	if workspaceValue == "" {
+		workspaceValue = protocolWorkspace(flag.Args())
+	}
 	if workspaceValue == "" && flag.NArg() > 0 {
-		workspaceValue = flag.Arg(0)
+		firstArg := flag.Arg(0)
+		if !strings.HasPrefix(strings.ToLower(firstArg), "xingkong-helper://") {
+			workspaceValue = firstArg
+		}
 	}
 	if workspaceValue == "" {
 		workspaceValue = strings.TrimSpace(os.Getenv("XINGKONG_WORKSPACE"))
 	}
 	if workspaceValue == "" {
-		workspaceValue = "."
+		workspaceValue = defaultWorkspace()
 	}
 
 	root, err := filepath.Abs(workspaceValue)
@@ -95,6 +103,11 @@ func main() {
 	}
 	if host != "127.0.0.1" && host != "localhost" {
 		log.Printf("warning: helper is listening on %s; 127.0.0.1 is strongly recommended", *addr)
+	}
+	if *installProtocol {
+		if err := installLauncherProtocol(); err != nil {
+			log.Printf("warning: failed to install launcher protocol: %v", err)
+		}
 	}
 
 	s := &server{
@@ -347,6 +360,55 @@ func truncateOutput(value string, maxBytes int) (string, bool) {
 		return value, false
 	}
 	return value[:maxBytes] + "\n[truncated]", true
+}
+
+func defaultWorkspace() string {
+	if runtime.GOOS == "windows" {
+		if exe, err := os.Executable(); err == nil {
+			return filepath.Dir(exe)
+		}
+	}
+	return "."
+}
+
+func protocolWorkspace(args []string) string {
+	for _, arg := range args {
+		if !strings.HasPrefix(strings.ToLower(arg), "xingkong-helper://") {
+			continue
+		}
+		parsed, err := url.Parse(arg)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(parsed.Query().Get("workspace"))
+	}
+	return ""
+}
+
+func installLauncherProtocol() error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, err = filepath.Abs(exe)
+	if err != nil {
+		return err
+	}
+	commands := [][]string{
+		{"add", `HKCU\Software\Classes\xingkong-helper`, "/ve", "/d", "URL:Xingkong Agent Helper", "/f"},
+		{"add", `HKCU\Software\Classes\xingkong-helper`, "/v", "URL Protocol", "/d", "", "/f"},
+		{"add", `HKCU\Software\Classes\xingkong-helper\DefaultIcon`, "/ve", "/d", exe, "/f"},
+		{"add", `HKCU\Software\Classes\xingkong-helper\shell\open\command`, "/ve", "/d", `"` + exe + `" "%1"`, "/f"},
+	}
+	for _, args := range commands {
+		if output, err := exec.Command("reg", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("reg %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		}
+	}
+	return nil
 }
 
 func workspaceWarning(root string) string {
