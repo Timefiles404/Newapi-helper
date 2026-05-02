@@ -21,7 +21,7 @@ import (
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.0"
+	version          = "0.1.4"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
@@ -156,18 +156,21 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	var req execRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&req); err != nil {
+		log.Printf("exec rejected: invalid json from %s", r.RemoteAddr)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 
 	req.Command = strings.TrimSpace(req.Command)
 	if req.Command == "" {
+		log.Printf("exec rejected: empty command from %s cwd=%q", r.RemoteAddr, req.CWD)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "command_required"})
 		return
 	}
 
 	cwd, err := s.resolveCWD(req.CWD)
 	if err != nil {
+		log.Printf("exec rejected: invalid cwd from %s cwd=%q error=%s", r.RemoteAddr, req.CWD, err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -181,6 +184,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	started := time.Now()
+	log.Printf("exec start: cwd=%s command=%q timeout=%s", cwd, req.Command, timeout)
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
@@ -212,6 +216,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	if ctx.Err() == context.DeadlineExceeded {
 		resp.ExitCode = -1
 		resp.Error = "command_timeout"
+		log.Printf("exec done: exit=%d duration=%dms error=%s command=%q", resp.ExitCode, resp.DurationMS, resp.Error, req.Command)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -225,12 +230,14 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 			resp.ExitCode = -1
 			resp.Error = err.Error()
 		}
+		log.Printf("exec done: exit=%d duration=%dms error=%s command=%q", resp.ExitCode, resp.DurationMS, resp.Error, req.Command)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
 	resp.OK = true
 	resp.ExitCode = 0
+	log.Printf("exec done: exit=%d duration=%dms command=%q", resp.ExitCode, resp.DurationMS, req.Command)
 	writeJSON(w, http.StatusOK, resp)
 }
 
