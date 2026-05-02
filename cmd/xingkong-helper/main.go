@@ -24,7 +24,7 @@ import (
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.6"
+	version          = "0.1.7"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
@@ -86,7 +86,7 @@ type pairResponse struct {
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
-	pairCodeFlag := flag.String("pair-code", "", "one-time pairing code from the web UI")
+	pairCodeFlag := flag.String("pair-code", "", "override the helper-generated one-time pairing code")
 	origins := flag.String("origins", "*", "deprecated; CORS now echoes any browser origin and protects exec with pairing")
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
