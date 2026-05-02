@@ -69,7 +69,7 @@ func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
 	origins := flag.String("origins", "https://new.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
-	installProtocol := flag.Bool("install-protocol", runtime.GOOS == "windows", "register xingkong-helper:// launcher protocol for the current executable")
+	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
 
 	workspaceValue := strings.TrimSpace(*workspace)
