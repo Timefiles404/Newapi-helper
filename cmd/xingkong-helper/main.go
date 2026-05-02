@@ -26,7 +26,7 @@ import (
 
 const (
 	appName           = "xingkong-agent-helper"
-	version           = "0.1.10"
+	version           = "0.1.11"
 	defaultAddr       = "127.0.0.1:8787"
 	defaultMaxOutput  = 128 * 1024
 	defaultTimeout    = 120 * time.Second
@@ -38,7 +38,12 @@ const (
 	maxFSRequestBytes = 16 * 1024 * 1024
 	agentDataDir      = ".xkagent"
 	agentHistoryFile  = "playground-agent-conversations.json"
+	helperStateFile   = "helper-state.json"
 )
+
+type helperState struct {
+	LastURL string `json:"last_url"`
+}
 
 type server struct {
 	addr          string
@@ -133,7 +138,6 @@ func main() {
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
 	_ = origins
-	interactiveMode, activeURL := chooseInteractiveMode()
 
 	workspaceValue := strings.TrimSpace(*workspace)
 	if workspaceValue == "" {
@@ -166,6 +170,7 @@ func main() {
 	if info, err := os.Stat(root); err != nil || !info.IsDir() {
 		log.Fatalf("workspace must be an existing directory: %s", root)
 	}
+	interactiveMode, activeURL := chooseInteractiveMode(root)
 
 	host, _, err := net.SplitHostPort(*addr)
 	if err != nil {
@@ -193,7 +198,7 @@ func main() {
 	mux.HandleFunc("/v1/exec", s.handleExec)
 	mux.HandleFunc("/v1/fs", s.handleFS)
 
-	if interactiveMode == "active" {
+	if interactiveMode == "active" || interactiveMode == "resume" {
 		server := &http.Server{Addr: *addr, Handler: s.withCORS(mux)}
 		go func() {
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -201,12 +206,19 @@ func main() {
 			}
 		}()
 		printStartupInfo(*addr, root, pairCode, s.workspaceWarn)
-		target := buildActiveLaunchURL(activeURL, pairCode)
+		if err := saveLastLaunchURL(root, activeURL); err != nil {
+			log.Printf("warning: failed to save last NewAPI URL: %v", err)
+		}
+		target := buildActiveLaunchURL(activeURL, pairCode, interactiveMode == "resume")
 		fmt.Printf("\n正在打开 NewAPI：%s\n", target)
 		if err := openBrowser(target); err != nil {
 			fmt.Printf("自动打开浏览器失败，请手动复制上面的地址打开：%v\n", err)
 		}
-		fmt.Println("已进入主动启动模式。保持此窗口打开，网页会自动新建 Agent 对话并完成配对。")
+		if interactiveMode == "resume" {
+			fmt.Println("已进入延续对话模式。保持此窗口打开，网页会自动接续该工作目录的上次 Agent 会话。")
+		} else {
+			fmt.Println("已进入主动启动模式。保持此窗口打开，网页会自动新建 Agent 对话并完成配对。")
+		}
 		select {}
 	}
 
@@ -701,21 +713,30 @@ func isSafeEnvKey(key string) bool {
 	return true
 }
 
-func chooseInteractiveMode() (string, string) {
+func chooseInteractiveMode(root string) (string, string) {
 	if len(os.Args) > 1 || strings.TrimSpace(os.Getenv("XINGKONG_HELPER_NO_MENU")) != "" {
 		return "", ""
 	}
+	lastURL := readLastLaunchURL(root)
 	fmt.Println("星空 Agent Helper")
 	fmt.Println("当前目录将作为 Agent 工作目录。")
 	fmt.Println()
 	fmt.Println("请选择启动模式：")
 	fmt.Println("1. 配对模式：显示配对 key，打开 NewAPI 后手动输入配对")
 	fmt.Println("2. 主动启动模式：粘贴 NewAPI 网址，自动打开页面、新建 Agent 对话并静默配对")
-	fmt.Print("请输入 1 或 2 后回车（默认 1）：")
+	if lastURL != "" {
+		fmt.Printf("3. 延续上一次对话：打开 %s 并接续当前工作目录的历史会话\n", lastURL)
+		fmt.Print("请输入 1、2 或 3 后回车（默认 1）：")
+	} else {
+		fmt.Print("请输入 1 或 2 后回车（默认 1）：")
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	choice, _ := reader.ReadString('\n')
 	choice = strings.TrimSpace(choice)
+	if choice == "3" && lastURL != "" {
+		return "resume", lastURL
+	}
 	if choice != "2" {
 		return "pair", ""
 	}
@@ -728,6 +749,46 @@ func chooseInteractiveMode() (string, string) {
 		}
 		return "active", target
 	}
+}
+
+func readLastLaunchURL(root string) string {
+	content, err := os.ReadFile(filepath.Join(root, agentDataDir, helperStateFile))
+	if err != nil {
+		return ""
+	}
+	var state helperState
+	if err := json.Unmarshal(content, &state); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(state.LastURL)
+}
+
+func saveLastLaunchURL(root, rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "https://" + rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	if parsed.Path == "" || parsed.Path == "/" {
+		parsed.Path = "/playground/"
+	}
+	content, err := json.MarshalIndent(helperState{LastURL: parsed.String()}, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(root, agentDataDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, helperStateFile), content, 0o600)
 }
 
 func printStartupInfo(addr, root, pairCode, warning string) {
@@ -745,7 +806,7 @@ func printStartupInfo(addr, root, pairCode, warning string) {
 	}
 }
 
-func buildActiveLaunchURL(rawURL, pairCode string) string {
+func buildActiveLaunchURL(rawURL, pairCode string, resume bool) string {
 	if !strings.Contains(rawURL, "://") {
 		rawURL = "https://" + rawURL
 	}
@@ -760,6 +821,9 @@ func buildActiveLaunchURL(rawURL, pairCode string) string {
 	query.Set("xingkong_agent_mode", "1")
 	query.Set("xingkong_helper_pair_code", pairCode)
 	query.Set("xingkong_helper_autostart", "1")
+	if resume {
+		query.Set("xingkong_helper_resume", "1")
+	}
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }
