@@ -25,16 +25,19 @@ import (
 )
 
 const (
-	appName          = "xingkong-agent-helper"
-	version          = "0.1.9"
-	defaultAddr      = "127.0.0.1:8787"
-	defaultMaxOutput = 128 * 1024
-	defaultTimeout   = 120 * time.Second
-	maxTimeout       = 5 * time.Minute
-	maxReadBytes     = 1024 * 1024
-	maxSearchFiles   = 300
-	maxSearchResults = 50
-	searchReadBytes  = 512 * 1024
+	appName           = "xingkong-agent-helper"
+	version           = "0.1.10"
+	defaultAddr       = "127.0.0.1:8787"
+	defaultMaxOutput  = 128 * 1024
+	defaultTimeout    = 120 * time.Second
+	maxTimeout        = 5 * time.Minute
+	maxReadBytes      = 1024 * 1024
+	maxSearchFiles    = 300
+	maxSearchResults  = 50
+	searchReadBytes   = 512 * 1024
+	maxFSRequestBytes = 16 * 1024 * 1024
+	agentDataDir      = ".xkagent"
+	agentHistoryFile  = "playground-agent-conversations.json"
 )
 
 type server struct {
@@ -374,7 +377,7 @@ func (s *server) handleFS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req fsRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*1024*1024)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSRequestBytes)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
@@ -511,9 +514,54 @@ func (s *server) executeFS(req fsRequest) (fsResponse, error) {
 			return fsResponse{}, err
 		}
 		return fsResponse{OK: true, Path: path, Output: "opened", Summary: "opened in file manager"}, nil
+	case "agent_history_load":
+		content, err := s.readAgentHistory()
+		if err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: agentDataDir + "/" + agentHistoryFile, Output: content, Summary: "agent history loaded"}, nil
+	case "agent_history_save":
+		if err := s.writeAgentHistory(req.Content); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: agentDataDir + "/" + agentHistoryFile, Output: "saved", Summary: "agent history saved"}, nil
 	default:
 		return fsResponse{}, errors.New("unsupported_fs_op")
 	}
+}
+
+func (s *server) agentHistoryPath() string {
+	return filepath.Join(s.workspace, agentDataDir, agentHistoryFile)
+}
+
+func (s *server) readAgentHistory() (string, error) {
+	path := s.agentHistoryPath()
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return `{"conversations":[],"activeConversationId":null}`, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !json.Valid(content) {
+		return "", errors.New("agent_history_invalid_json")
+	}
+	return string(content), nil
+}
+
+func (s *server) writeAgentHistory(content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		content = `{"conversations":[],"activeConversationId":null}`
+	}
+	if !json.Valid([]byte(content)) {
+		return errors.New("agent_history_invalid_json")
+	}
+	path := s.agentHistoryPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o600)
 }
 
 func (s *server) resolveCWD(value string) (string, error) {
@@ -772,6 +820,9 @@ func listDirectory(fullPath, displayPath string) ([]workspaceEntry, string, erro
 		base = ""
 	}
 	for _, item := range items {
+		if item.Name() == agentDataDir {
+			continue
+		}
 		kind := "file"
 		prefix := "file"
 		if item.IsDir() {
@@ -872,7 +923,7 @@ func searchWorkspaceFiles(root, displayPath, query string, maxResults int) (stri
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "vendor" {
+			if d.Name() == agentDataDir || d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil
