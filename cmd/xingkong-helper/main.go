@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,12 +18,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.5"
+	version          = "0.1.6"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
@@ -29,10 +32,13 @@ const (
 )
 
 type server struct {
-	addr           string
-	workspace      string
-	workspaceWarn  string
-	allowedOrigins []string
+	addr          string
+	workspace     string
+	workspaceWarn string
+	pairCode      string
+	token         string
+	tokenExpires  time.Time
+	mu            sync.RWMutex
 }
 
 type statusResponse struct {
@@ -44,6 +50,8 @@ type statusResponse struct {
 	Workspace        string `json:"workspace"`
 	WorkspaceWarning string `json:"workspace_warning,omitempty"`
 	Shell            string `json:"shell"`
+	Paired           bool   `json:"paired"`
+	PairingRequired  bool   `json:"pairing_required"`
 }
 
 type execRequest struct {
@@ -65,12 +73,24 @@ type execResponse struct {
 	Truncated  bool   `json:"truncated,omitempty"`
 }
 
+type pairRequest struct {
+	Code string `json:"code"`
+}
+
+type pairResponse struct {
+	OK        bool   `json:"ok"`
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
+
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
-	origins := flag.String("origins", "https://new.xingkongai.online,https://test.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
+	pairCodeFlag := flag.String("pair-code", "", "one-time pairing code from the web UI")
+	origins := flag.String("origins", "*", "deprecated; CORS now echoes any browser origin and protects exec with pairing")
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
+	_ = origins
 
 	workspaceValue := strings.TrimSpace(*workspace)
 	if workspaceValue == "" {
@@ -87,6 +107,13 @@ func main() {
 	}
 	if workspaceValue == "" {
 		workspaceValue = defaultWorkspace()
+	}
+	pairCode := strings.TrimSpace(*pairCodeFlag)
+	if pairCode == "" {
+		pairCode = protocolPairCode(flag.Args())
+	}
+	if pairCode == "" {
+		pairCode = randomDigits(8)
 	}
 
 	root, err := filepath.Abs(workspaceValue)
@@ -111,22 +138,24 @@ func main() {
 	}
 
 	s := &server{
-		addr:           *addr,
-		workspace:      root,
-		workspaceWarn:  workspaceWarning(root),
-		allowedOrigins: splitCSV(*origins),
+		addr:          *addr,
+		workspace:     root,
+		workspaceWarn: workspaceWarning(root),
+		pairCode:      pairCode,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
+	mux.HandleFunc("/v1/pair", s.handlePair)
 	mux.HandleFunc("/v1/exec", s.handleExec)
 
 	log.Printf("%s %s listening on http://%s", appName, version, *addr)
 	log.Printf("workspace: %s", root)
-	log.Printf("allowed origins: %s", strings.Join(s.allowedOrigins, ", "))
+	log.Printf("CORS: any browser origin is accepted; /v1/exec requires pairing")
+	log.Printf("pairing code: %s", pairCode)
 	if s.workspaceWarn != "" {
 		log.Printf("warning: %s", s.workspaceWarn)
-		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\"")
+		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\" --pair-code %s", pairCode)
 	}
 	log.Fatal(http.ListenAndServe(*addr, s.withCORS(mux)))
 }
@@ -146,12 +175,52 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Workspace:        s.workspace,
 		WorkspaceWarning: s.workspaceWarn,
 		Shell:            shellName(),
+		Paired:           s.hasValidToken(""),
+		PairingRequired:  true,
+	})
+}
+
+func (s *server) handlePair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+
+	var req pairRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+
+	code := strings.TrimSpace(req.Code)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if code == "" || s.pairCode == "" || code != s.pairCode {
+		log.Printf("pair rejected: invalid code from %s", r.RemoteAddr)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_pair_code"})
+		return
+	}
+
+	token := randomToken(32)
+	s.token = token
+	s.tokenExpires = time.Now().Add(24 * time.Hour)
+	s.pairCode = ""
+	log.Printf("pair accepted: token expires at %s", s.tokenExpires.Format(time.RFC3339))
+	writeJSON(w, http.StatusOK, pairResponse{
+		OK:        true,
+		Token:     token,
+		ExpiresAt: s.tokenExpires.Format(time.RFC3339),
 	})
 }
 
 func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	if !s.hasValidToken(s.requestToken(r)) {
+		log.Printf("exec rejected: helper not paired from %s", r.RemoteAddr)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "helper_not_paired"})
 		return
 	}
 
@@ -270,25 +339,16 @@ func (s *server) resolveCWD(value string) (string, error) {
 func (s *server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && s.isOriginAllowed(origin) {
+		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Xingkong-Helper-Token")
 			w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		}
 
 		if r.Method == http.MethodOptions {
-			if origin == "" || !s.isOriginAllowed(origin) {
-				w.WriteHeader(http.StatusForbidden)
-				return
-			}
 			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		if origin != "" && !s.isOriginAllowed(origin) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "origin_not_allowed"})
 			return
 		}
 
@@ -296,19 +356,28 @@ func (s *server) withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func (s *server) isOriginAllowed(origin string) bool {
-	for _, allowed := range s.allowedOrigins {
-		if allowed == origin {
-			return true
-		}
-		if strings.HasSuffix(allowed, ":*") {
-			prefix := strings.TrimSuffix(allowed, "*")
-			if strings.HasPrefix(origin, prefix) {
-				return true
-			}
-		}
+func (s *server) requestToken(r *http.Request) string {
+	token := strings.TrimSpace(r.Header.Get("X-Xingkong-Helper-Token"))
+	if token != "" {
+		return token
 	}
-	return false
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func (s *server) hasValidToken(value string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.token == "" || time.Now().After(s.tokenExpires) {
+		return false
+	}
+	if value == "" {
+		return true
+	}
+	return value == s.token
 }
 
 func shellCommand(ctx context.Context, command string) *exec.Cmd {
@@ -391,6 +460,45 @@ func protocolWorkspace(args []string) string {
 		return strings.TrimSpace(parsed.Query().Get("workspace"))
 	}
 	return ""
+}
+
+func protocolPairCode(args []string) string {
+	for _, arg := range args {
+		if !strings.HasPrefix(strings.ToLower(arg), "xingkong-helper://") {
+			continue
+		}
+		parsed, err := url.Parse(arg)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(parsed.Query().Get("pair_code"))
+	}
+	return ""
+}
+
+func randomDigits(length int) string {
+	if length <= 0 {
+		length = 8
+	}
+	buf := make([]byte, length)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%0*d", length, time.Now().UnixNano()%100000000)
+	}
+	for i := range buf {
+		buf[i] = '0' + (buf[i] % 10)
+	}
+	return string(buf)
+}
+
+func randomToken(bytesLen int) string {
+	if bytesLen <= 0 {
+		bytesLen = 32
+	}
+	buf := make([]byte, bytesLen)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }
 
 func installLauncherProtocol() error {
