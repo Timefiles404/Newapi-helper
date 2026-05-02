@@ -8,6 +8,18 @@
 go run ./cmd/xingkong-helper --workspace /path/to/project
 ```
 
+Windows 下载构建产物后，不需要把 exe 放进项目目录；建议这样启动：
+
+```powershell
+.\xingkong-helper-windows-amd64.exe --workspace "D:\你的项目目录"
+```
+
+也可以直接把目录作为第一个参数：
+
+```powershell
+.\xingkong-helper-windows-amd64.exe "D:\你的项目目录"
+```
+
 默认监听 `127.0.0.1:8787`，只允许 `https://new.xingkongai.online`、`http://localhost:*`、`http://127.0.0.1:*` 这些来源访问。
 
 ## 接口

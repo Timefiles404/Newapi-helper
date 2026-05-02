@@ -30,17 +30,19 @@ const (
 type server struct {
 	addr           string
 	workspace      string
+	workspaceWarn  string
 	allowedOrigins []string
 }
 
 type statusResponse struct {
-	App       string `json:"app"`
-	Version   string `json:"version"`
-	OS        string `json:"os"`
-	Arch      string `json:"arch"`
-	Addr      string `json:"addr"`
-	Workspace string `json:"workspace"`
-	Shell     string `json:"shell"`
+	App              string `json:"app"`
+	Version          string `json:"version"`
+	OS               string `json:"os"`
+	Arch             string `json:"arch"`
+	Addr             string `json:"addr"`
+	Workspace        string `json:"workspace"`
+	WorkspaceWarning string `json:"workspace_warning,omitempty"`
+	Shell            string `json:"shell"`
 }
 
 type execRequest struct {
@@ -64,11 +66,22 @@ type execResponse struct {
 
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
-	workspace := flag.String("workspace", ".", "workspace root for commands")
+	workspace := flag.String("workspace", "", "workspace root for commands")
 	origins := flag.String("origins", "https://new.xingkongai.online,http://localhost:3000,http://127.0.0.1:3000", "comma separated allowed origins")
 	flag.Parse()
 
-	root, err := filepath.Abs(*workspace)
+	workspaceValue := strings.TrimSpace(*workspace)
+	if workspaceValue == "" && flag.NArg() > 0 {
+		workspaceValue = flag.Arg(0)
+	}
+	if workspaceValue == "" {
+		workspaceValue = strings.TrimSpace(os.Getenv("XINGKONG_WORKSPACE"))
+	}
+	if workspaceValue == "" {
+		workspaceValue = "."
+	}
+
+	root, err := filepath.Abs(workspaceValue)
 	if err != nil {
 		log.Fatalf("resolve workspace: %v", err)
 	}
@@ -87,6 +100,7 @@ func main() {
 	s := &server{
 		addr:           *addr,
 		workspace:      root,
+		workspaceWarn:  workspaceWarning(root),
 		allowedOrigins: splitCSV(*origins),
 	}
 
@@ -96,6 +110,10 @@ func main() {
 
 	log.Printf("%s %s listening on http://%s", appName, version, *addr)
 	log.Printf("workspace: %s", root)
+	if s.workspaceWarn != "" {
+		log.Printf("warning: %s", s.workspaceWarn)
+		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\"")
+	}
 	log.Fatal(http.ListenAndServe(*addr, s.withCORS(mux)))
 }
 
@@ -106,13 +124,14 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
-		App:       appName,
-		Version:   version,
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-		Addr:      s.addr,
-		Workspace: s.workspace,
-		Shell:     shellName(),
+		App:              appName,
+		Version:          version,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		Addr:             s.addr,
+		Workspace:        s.workspace,
+		WorkspaceWarning: s.workspaceWarn,
+		Shell:            shellName(),
 	})
 }
 
@@ -328,4 +347,13 @@ func truncateOutput(value string, maxBytes int) (string, bool) {
 		return value, false
 	}
 	return value[:maxBytes] + "\n[truncated]", true
+}
+
+func workspaceWarning(root string) string {
+	lower := strings.ToLower(filepath.Clean(root))
+	temp := strings.ToLower(filepath.Clean(os.TempDir()))
+	if temp != "" && (lower == temp || strings.HasPrefix(lower, temp+string(filepath.Separator))) {
+		return "workspace is under the system temp directory; start helper with --workspace pointing to the project directory"
+	}
+	return ""
 }
