@@ -28,7 +28,7 @@ import (
 
 const (
 	appName           = "xingkong-agent-helper"
-	version           = "0.1.12"
+	version           = "0.1.13"
 	defaultAddr       = "127.0.0.1:8787"
 	defaultMaxOutput  = 128 * 1024
 	defaultTimeout    = 120 * time.Second
@@ -40,6 +40,8 @@ const (
 	maxFSRequestBytes = 16 * 1024 * 1024
 	agentDataDir      = ".xkagent"
 	agentHistoryFile  = "playground-agent-conversations.json"
+	agentHistoryIndex = "playground-agent-index.json"
+	agentSessionsDir  = "sessions"
 	helperStateFile   = "helper-state.json"
 	latestReleaseAPI  = "https://api.github.com/repos/Timefiles404/Newapi-helper/releases/latest"
 	latestReleasePage = "https://github.com/Timefiles404/Newapi-helper/releases/latest"
@@ -118,6 +120,7 @@ type fsRequest struct {
 	End        int         `json:"end"`
 	MaxBytes   int         `json:"max_bytes"`
 	MaxResults int         `json:"max_results"`
+	Depth      int         `json:"depth"`
 	Whole      bool        `json:"whole"`
 	Edits      []batchEdit `json:"edits"`
 }
@@ -140,6 +143,13 @@ type fsResponse struct {
 	Summary string           `json:"summary,omitempty"`
 	Entries []workspaceEntry `json:"entries,omitempty"`
 	Error   string           `json:"error,omitempty"`
+}
+
+type agentHistoryEnvelope struct {
+	Conversations        []json.RawMessage `json:"conversations"`
+	ActiveConversationID any               `json:"activeConversationId"`
+	AgentSettings        json.RawMessage   `json:"agentSettings,omitempty"`
+	SavedAt              any               `json:"savedAt,omitempty"`
 }
 
 func main() {
@@ -438,7 +448,7 @@ func (s *server) executeFS(req fsRequest) (fsResponse, error) {
 		if err != nil {
 			return fsResponse{}, err
 		}
-		entries, output, err := listDirectory(fullPath, path)
+		entries, output, err := listDirectory(fullPath, path, req.Depth)
 		if err != nil {
 			return fsResponse{}, err
 		}
@@ -453,7 +463,7 @@ func (s *server) executeFS(req fsRequest) (fsResponse, error) {
 			return fsResponse{}, err
 		}
 		return fsResponse{OK: true, Path: path, Output: output, Summary: summary}, nil
-	case "search_files":
+	case "search_files", "grep":
 		if strings.TrimSpace(req.Query) == "" {
 			return fsResponse{}, errors.New("search_query_required")
 		}
@@ -564,7 +574,19 @@ func (s *server) agentHistoryPath() string {
 	return filepath.Join(s.workspace, agentDataDir, agentHistoryFile)
 }
 
+func (s *server) agentHistoryIndexPath() string {
+	return filepath.Join(s.workspace, agentDataDir, agentHistoryIndex)
+}
+
+func (s *server) agentSessionDir() string {
+	return filepath.Join(s.workspace, agentDataDir, agentSessionsDir)
+}
+
 func (s *server) readAgentHistory() (string, error) {
+	if content, err := s.readSplitAgentHistory(); err == nil && content != "" {
+		return content, nil
+	}
+
 	path := s.agentHistoryPath()
 	content, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -587,11 +609,134 @@ func (s *server) writeAgentHistory(content string) error {
 	if !json.Valid([]byte(content)) {
 		return errors.New("agent_history_invalid_json")
 	}
+	if err := s.writeSplitAgentHistory([]byte(content)); err != nil {
+		return err
+	}
 	path := s.agentHistoryPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func (s *server) readSplitAgentHistory() (string, error) {
+	indexBytes, err := os.ReadFile(s.agentHistoryIndexPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !json.Valid(indexBytes) {
+		return "", errors.New("agent_history_invalid_json")
+	}
+	var index map[string]json.RawMessage
+	if err := json.Unmarshal(indexBytes, &index); err != nil {
+		return "", errors.New("agent_history_invalid_json")
+	}
+	var ids []string
+	if raw := index["conversationIds"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &ids)
+	}
+
+	conversations := make([]json.RawMessage, 0, len(ids))
+	for _, id := range ids {
+		sessionBytes, err := os.ReadFile(filepath.Join(s.agentSessionDir(), safeSessionFileName(id)+".json"))
+		if err != nil || !json.Valid(sessionBytes) {
+			continue
+		}
+		conversations = append(conversations, json.RawMessage(sessionBytes))
+	}
+
+	envelope := map[string]any{
+		"conversations":        conversations,
+		"activeConversationId": nil,
+	}
+	if raw := index["activeConversationId"]; len(raw) > 0 {
+		envelope["activeConversationId"] = json.RawMessage(raw)
+	}
+	if raw := index["agentSettings"]; len(raw) > 0 {
+		envelope["agentSettings"] = json.RawMessage(raw)
+	}
+	if raw := index["savedAt"]; len(raw) > 0 {
+		envelope["savedAt"] = json.RawMessage(raw)
+	}
+	output, err := json.Marshal(envelope)
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+func (s *server) writeSplitAgentHistory(content []byte) error {
+	var envelope agentHistoryEnvelope
+	if err := json.Unmarshal(content, &envelope); err != nil {
+		return errors.New("agent_history_invalid_json")
+	}
+
+	sessionDir := s.agentSessionDir()
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		return err
+	}
+
+	ids := make([]string, 0, len(envelope.Conversations))
+	for index, conversation := range envelope.Conversations {
+		id := conversationID(conversation)
+		if id == "" {
+			id = fmt.Sprintf("conversation-%d", index+1)
+		}
+		ids = append(ids, id)
+		if err := os.WriteFile(filepath.Join(sessionDir, safeSessionFileName(id)+".json"), conversation, 0o600); err != nil {
+			return err
+		}
+	}
+
+	indexDoc := map[string]any{
+		"conversationIds":      ids,
+		"activeConversationId": envelope.ActiveConversationID,
+		"savedAt":              time.Now().UnixMilli(),
+	}
+	if len(envelope.AgentSettings) > 0 {
+		indexDoc["agentSettings"] = envelope.AgentSettings
+	}
+	if envelope.SavedAt != nil {
+		indexDoc["savedAt"] = envelope.SavedAt
+	}
+	indexBytes, err := json.MarshalIndent(indexDoc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.agentHistoryIndexPath(), indexBytes, 0o600)
+}
+
+func conversationID(raw json.RawMessage) string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return ""
+	}
+	for _, key := range []string{"id", "key"} {
+		var value string
+		if rawValue := item[key]; len(rawValue) > 0 && json.Unmarshal(rawValue, &value) == nil {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func safeSessionFileName(id string) string {
+	id = strings.TrimSpace(id)
+	var builder strings.Builder
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			builder.WriteRune(r)
+		} else {
+			builder.WriteRune('_')
+		}
+	}
+	if builder.Len() == 0 {
+		return "conversation"
+	}
+	return builder.String()
 }
 
 func (s *server) resolveCWD(value string) (string, error) {
@@ -1142,13 +1287,12 @@ func cleanDisplayPath(value string) string {
 	return strings.TrimPrefix(value, "./")
 }
 
-func listDirectory(fullPath, displayPath string) ([]workspaceEntry, string, error) {
+func listDirectory(fullPath, displayPath string, depth int) ([]workspaceEntry, string, error) {
 	items, err := os.ReadDir(fullPath)
 	if err != nil {
 		return nil, "", err
 	}
 	entries := make([]workspaceEntry, 0, len(items))
-	lines := make([]string, 0, len(items))
 	base := cleanDisplayPath(displayPath)
 	if base == "." {
 		base = ""
@@ -1158,14 +1302,11 @@ func listDirectory(fullPath, displayPath string) ([]workspaceEntry, string, erro
 			continue
 		}
 		kind := "file"
-		prefix := "file"
 		if item.IsDir() {
 			kind = "directory"
-			prefix = "dir "
 		}
 		entryPath := strings.TrimPrefix(base+"/"+item.Name(), "/")
 		entries = append(entries, workspaceEntry{Name: item.Name(), Path: entryPath, Kind: kind})
-		lines = append(lines, fmt.Sprintf("%s\t%s", prefix, item.Name()))
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].Kind != entries[j].Kind {
@@ -1173,11 +1314,83 @@ func listDirectory(fullPath, displayPath string) ([]workspaceEntry, string, erro
 		}
 		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
 	})
-	sort.Strings(lines)
+	lines, err := listDirectoryTree(fullPath, base, normalizeListDepth(depth), 0, "")
+	if err != nil {
+		return nil, "", err
+	}
 	if len(lines) == 0 {
 		return entries, "(empty directory)", nil
 	}
 	return entries, strings.Join(lines, "\n"), nil
+}
+
+func normalizeListDepth(depth int) int {
+	if depth <= 0 {
+		return 1
+	}
+	if depth > 5 {
+		return 5
+	}
+	return depth
+}
+
+func listDirectoryTree(fullPath, displayPath string, remainingDepth, level int, prefix string) ([]string, error) {
+	items, err := os.ReadDir(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	items = filterAndSortDirEntries(items)
+	lines := make([]string, 0, len(items))
+
+	for _, item := range items {
+		entryPath := strings.TrimPrefix(displayPath+"/"+item.Name(), "/")
+		kind := "file"
+		if item.IsDir() {
+			kind = "dir "
+		}
+		lines = append(lines, fmt.Sprintf("%s%s\t%s", prefix, kind, entryPath))
+		if !item.IsDir() {
+			continue
+		}
+
+		childPath := filepath.Join(fullPath, item.Name())
+		childItems, err := os.ReadDir(childPath)
+		if err != nil {
+			continue
+		}
+		childItems = filterAndSortDirEntries(childItems)
+		collapseSingleChild := len(childItems) == 1
+		if remainingDepth <= 1 && !collapseSingleChild {
+			continue
+		}
+		nextDepth := remainingDepth
+		if !collapseSingleChild {
+			nextDepth--
+		}
+		childLines, err := listDirectoryTree(childPath, entryPath, nextDepth, level+1, strings.Repeat("  ", level+1))
+		if err != nil {
+			continue
+		}
+		lines = append(lines, childLines...)
+	}
+	return lines, nil
+}
+
+func filterAndSortDirEntries(items []os.DirEntry) []os.DirEntry {
+	filtered := make([]os.DirEntry, 0, len(items))
+	for _, item := range items {
+		if item.Name() == agentDataDir {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].IsDir() != filtered[j].IsDir() {
+			return filtered[i].IsDir()
+		}
+		return strings.ToLower(filtered[i].Name()) < strings.ToLower(filtered[j].Name())
+	})
+	return filtered
 }
 
 func readTextFile(fullPath string, req fsRequest) (string, string, error) {
