@@ -26,7 +26,7 @@ import (
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.8"
+	version          = "0.1.9"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
@@ -502,6 +502,15 @@ func (s *server) executeFS(req fsRequest) (fsResponse, error) {
 			return fsResponse{}, err
 		}
 		return fsResponse{OK: true, Path: path, Output: "created", Summary: "directory created"}, nil
+	case "reveal_path":
+		fullPath, err := s.resolveWorkspacePath(path, false)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		if err := revealPath(fullPath); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: "opened", Summary: "opened in file manager"}, nil
 	default:
 		return fsResponse{}, errors.New("unsupported_fs_op")
 	}
@@ -712,6 +721,31 @@ func openBrowser(target string) error {
 	case "windows":
 		return exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start()
 	case "darwin":
+		return exec.Command("open", target).Start()
+	default:
+		return exec.Command("xdg-open", target).Start()
+	}
+}
+
+func revealPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	target := path
+	if !info.IsDir() {
+		target = filepath.Dir(path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		if !info.IsDir() {
+			return exec.Command("explorer.exe", "/select,"+path).Start()
+		}
+		return exec.Command("explorer.exe", target).Start()
+	case "darwin":
+		if !info.IsDir() {
+			return exec.Command("open", "-R", path).Start()
+		}
 		return exec.Command("open", target).Start()
 	default:
 		return exec.Command("xdg-open", target).Start()
