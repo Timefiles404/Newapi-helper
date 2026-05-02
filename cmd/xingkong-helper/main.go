@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +28,7 @@ import (
 
 const (
 	appName           = "xingkong-agent-helper"
-	version           = "0.1.11"
+	version           = "0.1.12"
 	defaultAddr       = "127.0.0.1:8787"
 	defaultMaxOutput  = 128 * 1024
 	defaultTimeout    = 120 * time.Second
@@ -39,10 +41,20 @@ const (
 	agentDataDir      = ".xkagent"
 	agentHistoryFile  = "playground-agent-conversations.json"
 	helperStateFile   = "helper-state.json"
+	latestReleaseAPI  = "https://api.github.com/repos/Timefiles404/Newapi-helper/releases/latest"
+	latestReleasePage = "https://github.com/Timefiles404/Newapi-helper/releases/latest"
 )
 
 type helperState struct {
 	LastURL string `json:"last_url"`
+}
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
 }
 
 type server struct {
@@ -136,8 +148,14 @@ func main() {
 	pairCodeFlag := flag.String("pair-code", "", "override the helper-generated one-time pairing code")
 	origins := flag.String("origins", "*", "deprecated; CORS now echoes any browser origin and protects exec with pairing")
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
+	skipUpdate := flag.Bool("skip-update", false, "skip helper auto update check")
 	flag.Parse()
 	_ = origins
+	if !*skipUpdate && strings.TrimSpace(os.Getenv("XINGKONG_HELPER_SKIP_UPDATE")) == "" {
+		if updated := checkAndApplyUpdate(); updated {
+			return
+		}
+	}
 
 	workspaceValue := strings.TrimSpace(*workspace)
 	if workspaceValue == "" {
@@ -698,6 +716,258 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func checkAndApplyUpdate() bool {
+	release, clientName, err := fetchLatestRelease()
+	if err != nil {
+		fmt.Printf("检查 Helper 更新失败：%v\n", err)
+		fmt.Printf("如果网页提示 Helper 版本过旧，请前往 %s 下载最新版并替换当前文件。\n", latestReleasePage)
+		return false
+	}
+	if compareVersions(release.TagName, version) <= 0 {
+		return false
+	}
+
+	assetName := helperAssetName()
+	downloadURL := ""
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		fmt.Printf("发现 Helper 新版本 %s，但未找到当前平台安装包：%s\n", release.TagName, assetName)
+		fmt.Printf("请前往 %s 手动下载最新版并替换当前文件。\n", latestReleasePage)
+		return false
+	}
+
+	fmt.Printf("发现 Helper 新版本 %s，正在更新（当前 %s，通道 %s）...\n", release.TagName, version, clientName)
+	nextPath, err := downloadUpdateAsset(downloadURL, assetName)
+	if err != nil {
+		fmt.Printf("自动下载更新失败：%v\n", err)
+		fmt.Printf("请前往 %s 手动下载最新版并替换当前文件。\n", latestReleasePage)
+		return false
+	}
+	if err := replaceAndRestart(nextPath); err != nil {
+		fmt.Printf("自动替换更新失败：%v\n", err)
+		fmt.Printf("已下载到：%s\n", nextPath)
+		fmt.Printf("请前往 %s 手动下载最新版并替换当前文件。\n", latestReleasePage)
+		return false
+	}
+	return true
+}
+
+func fetchLatestRelease() (githubRelease, string, error) {
+	var lastErr error
+	for _, candidate := range updateHTTPClients() {
+		req, err := http.NewRequest(http.MethodGet, latestReleaseAPI, nil)
+		if err != nil {
+			return githubRelease{}, "", err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", appName+"/"+version)
+		resp, err := candidate.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				lastErr = fmt.Errorf("%s returned HTTP %d", candidate.name, resp.StatusCode)
+				return
+			}
+			var release githubRelease
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&release); err != nil {
+				lastErr = err
+				return
+			}
+			if strings.TrimSpace(release.TagName) == "" {
+				lastErr = errors.New("github release missing tag_name")
+				return
+			}
+			lastErr = nil
+			resp.Body = nil
+			resp.Request = req
+			_ = resp
+			candidate.release = release
+		}()
+		if lastErr == nil && candidate.release.TagName != "" {
+			return candidate.release, candidate.name, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("all update channels failed")
+	}
+	return githubRelease{}, "", lastErr
+}
+
+type updateClientCandidate struct {
+	name    string
+	client  *http.Client
+	release githubRelease
+}
+
+func updateHTTPClients() []updateClientCandidate {
+	directTransport := http.DefaultTransport.(*http.Transport).Clone()
+	clients := []updateClientCandidate{{
+		name:   "direct",
+		client: &http.Client{Timeout: 8 * time.Second, Transport: directTransport},
+	}}
+	proxyURL, err := url.Parse("http://127.0.0.1:7890")
+	if err == nil {
+		proxyTransport := http.DefaultTransport.(*http.Transport).Clone()
+		proxyTransport.Proxy = http.ProxyURL(proxyURL)
+		clients = append(clients, updateClientCandidate{
+			name:   "127.0.0.1:7890",
+			client: &http.Client{Timeout: 15 * time.Second, Transport: proxyTransport},
+		})
+	}
+	return clients
+}
+
+func helperAssetName() string {
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	return fmt.Sprintf("xingkong-helper-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+}
+
+func downloadUpdateAsset(downloadURL, assetName string) (string, error) {
+	var lastErr error
+	for _, candidate := range updateHTTPClients() {
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", appName+"/"+version)
+		resp, err := candidate.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		nextPath := filepath.Join(os.TempDir(), assetName+".new")
+		err = func() error {
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return fmt.Errorf("%s returned HTTP %d", candidate.name, resp.StatusCode)
+			}
+			file, err := os.OpenFile(nextPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			if _, err := io.Copy(file, resp.Body); err != nil {
+				return err
+			}
+			return os.Chmod(nextPath, 0o755)
+		}()
+		if err == nil {
+			return nextPath, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("download failed")
+	}
+	return "", lastErr
+}
+
+func replaceAndRestart(nextPath string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, err = filepath.Abs(exe)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Helper 更新下载完成，正在替换并重启...")
+	if runtime.GOOS == "windows" {
+		return replaceAndRestartWindows(exe, nextPath)
+	}
+	if err := os.Rename(nextPath, exe); err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(), "XINGKONG_HELPER_SKIP_UPDATE=1")
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	os.Exit(0)
+	return nil
+}
+
+func replaceAndRestartWindows(exe, nextPath string) error {
+	scriptPath := filepath.Join(os.TempDir(), "xingkong-helper-update.cmd")
+	args := quoteWindowsArgs(os.Args[1:])
+	script := fmt.Sprintf(`@echo off
+setlocal
+set XINGKONG_HELPER_SKIP_UPDATE=1
+ping 127.0.0.1 -n 2 > nul
+move /Y %q %q > nul
+start "" %q %s
+del "%%~f0"
+`, nextPath, exe, exe, args)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		return err
+	}
+	if err := exec.Command("cmd.exe", "/C", "start", "", scriptPath).Start(); err != nil {
+		return err
+	}
+	os.Exit(0)
+	return nil
+}
+
+func quoteWindowsArgs(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func compareVersions(left, right string) int {
+	left = strings.TrimPrefix(strings.TrimSpace(left), "v")
+	right = strings.TrimPrefix(strings.TrimSpace(right), "v")
+	leftParts := strings.Split(left, ".")
+	rightParts := strings.Split(right, ".")
+	for i := 0; i < 3; i++ {
+		lv, rv := 0, 0
+		if i < len(leftParts) {
+			lv, _ = strconv.Atoi(numericPrefix(leftParts[i]))
+		}
+		if i < len(rightParts) {
+			rv, _ = strconv.Atoi(numericPrefix(rightParts[i]))
+		}
+		if lv > rv {
+			return 1
+		}
+		if lv < rv {
+			return -1
+		}
+	}
+	return 0
+}
+
+func numericPrefix(value string) string {
+	var builder strings.Builder
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			break
+		}
+		builder.WriteRune(r)
+	}
+	if builder.Len() == 0 {
+		return "0"
+	}
+	return builder.String()
 }
 
 func isSafeEnvKey(key string) bool {
