@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -17,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,11 +26,15 @@ import (
 
 const (
 	appName          = "xingkong-agent-helper"
-	version          = "0.1.7"
+	version          = "0.1.8"
 	defaultAddr      = "127.0.0.1:8787"
 	defaultMaxOutput = 128 * 1024
 	defaultTimeout   = 120 * time.Second
 	maxTimeout       = 5 * time.Minute
+	maxReadBytes     = 1024 * 1024
+	maxSearchFiles   = 300
+	maxSearchResults = 50
+	searchReadBytes  = 512 * 1024
 )
 
 type server struct {
@@ -83,6 +89,39 @@ type pairResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+type fsRequest struct {
+	Op         string      `json:"op"`
+	Path       string      `json:"path"`
+	Content    string      `json:"content"`
+	Query      string      `json:"query"`
+	Start      int         `json:"start"`
+	End        int         `json:"end"`
+	MaxBytes   int         `json:"max_bytes"`
+	MaxResults int         `json:"max_results"`
+	Whole      bool        `json:"whole"`
+	Edits      []batchEdit `json:"edits"`
+}
+
+type batchEdit struct {
+	Find    string `json:"find"`
+	Replace string `json:"replace"`
+}
+
+type workspaceEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+}
+
+type fsResponse struct {
+	OK      bool             `json:"ok"`
+	Path    string           `json:"path"`
+	Output  string           `json:"output,omitempty"`
+	Summary string           `json:"summary,omitempty"`
+	Entries []workspaceEntry `json:"entries,omitempty"`
+	Error   string           `json:"error,omitempty"`
+}
+
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address")
 	workspace := flag.String("workspace", "", "workspace root for commands")
@@ -91,6 +130,7 @@ func main() {
 	installProtocol := flag.Bool("install-protocol", false, "register xingkong-helper:// launcher protocol for the current executable")
 	flag.Parse()
 	_ = origins
+	interactiveMode, activeURL := chooseInteractiveMode()
 
 	workspaceValue := strings.TrimSpace(*workspace)
 	if workspaceValue == "" {
@@ -148,15 +188,26 @@ func main() {
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/pair", s.handlePair)
 	mux.HandleFunc("/v1/exec", s.handleExec)
+	mux.HandleFunc("/v1/fs", s.handleFS)
 
-	log.Printf("%s %s listening on http://%s", appName, version, *addr)
-	log.Printf("workspace: %s", root)
-	log.Printf("CORS: any browser origin is accepted; /v1/exec requires pairing")
-	log.Printf("pairing code: %s", pairCode)
-	if s.workspaceWarn != "" {
-		log.Printf("warning: %s", s.workspaceWarn)
-		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\" --pair-code %s", pairCode)
+	if interactiveMode == "active" {
+		server := &http.Server{Addr: *addr, Handler: s.withCORS(mux)}
+		go func() {
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("helper server failed: %v", err)
+			}
+		}()
+		printStartupInfo(*addr, root, pairCode, s.workspaceWarn)
+		target := buildActiveLaunchURL(activeURL, pairCode)
+		fmt.Printf("\n正在打开 NewAPI：%s\n", target)
+		if err := openBrowser(target); err != nil {
+			fmt.Printf("自动打开浏览器失败，请手动复制上面的地址打开：%v\n", err)
+		}
+		fmt.Println("已进入主动启动模式。保持此窗口打开，网页会自动新建 Agent 对话并完成配对。")
+		select {}
 	}
+
+	printStartupInfo(*addr, root, pairCode, s.workspaceWarn)
 	log.Fatal(http.ListenAndServe(*addr, s.withCORS(mux)))
 }
 
@@ -311,6 +362,151 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *server) handleFS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	if !s.hasValidToken(s.requestToken(r)) {
+		log.Printf("fs rejected: helper not paired from %s", r.RemoteAddr)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "helper_not_paired"})
+		return
+	}
+
+	var req fsRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*1024*1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+
+	resp, err := s.executeFS(req)
+	if err != nil {
+		log.Printf("fs failed: op=%s path=%q error=%s", req.Op, req.Path, err)
+		writeJSON(w, http.StatusOK, fsResponse{
+			OK:    false,
+			Path:  cleanDisplayPath(req.Path),
+			Error: err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *server) executeFS(req fsRequest) (fsResponse, error) {
+	op := strings.TrimSpace(req.Op)
+	path := cleanDisplayPath(req.Path)
+	if path == "" {
+		path = "."
+	}
+
+	switch op {
+	case "list_dir":
+		fullPath, err := s.resolveWorkspacePath(path, true)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		entries, output, err := listDirectory(fullPath, path)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Entries: entries, Output: output}, nil
+	case "read_file":
+		fullPath, err := s.resolveWorkspacePath(path, false)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		output, summary, err := readTextFile(fullPath, req)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: output, Summary: summary}, nil
+	case "search_files":
+		if strings.TrimSpace(req.Query) == "" {
+			return fsResponse{}, errors.New("search_query_required")
+		}
+		fullPath, err := s.resolveWorkspacePath(path, true)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		output, summary, err := searchWorkspaceFiles(fullPath, path, req.Query, req.MaxResults)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: output, Summary: summary}, nil
+	case "write_file":
+		fullPath, err := s.resolveWorkspacePath(path, false)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return fsResponse{}, err
+		}
+		if err := os.WriteFile(fullPath, []byte(req.Content), 0o644); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: "written", Summary: fmt.Sprintf("%d chars written", len(req.Content))}, nil
+	case "append_file":
+		fullPath, err := s.resolveWorkspacePath(path, false)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return fsResponse{}, err
+		}
+		file, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		defer file.Close()
+		if _, err := file.WriteString(req.Content); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: "appended", Summary: fmt.Sprintf("%d chars appended", len(req.Content))}, nil
+	case "batch_edit":
+		if len(req.Edits) == 0 {
+			return fsResponse{}, errors.New("batch_edit_requires_edits")
+		}
+		fullPath, err := s.resolveWorkspacePath(path, false)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		contentBytes, err := os.ReadFile(fullPath)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		if len(contentBytes) > maxReadBytes {
+			return fsResponse{}, errors.New("file_too_large_for_batch_edit")
+		}
+		content := string(contentBytes)
+		applied := make([]string, 0, len(req.Edits))
+		appliedCount := 0
+		for index, edit := range req.Edits {
+			if edit.Find == "" || !strings.Contains(content, edit.Find) {
+				applied = append(applied, fmt.Sprintf("#%d: not found", index+1))
+				continue
+			}
+			content = strings.Replace(content, edit.Find, edit.Replace, 1)
+			applied = append(applied, fmt.Sprintf("#%d: applied", index+1))
+			appliedCount++
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: strings.Join(applied, "\n"), Summary: fmt.Sprintf("%d/%d edits applied", appliedCount, len(req.Edits))}, nil
+	case "create_dir":
+		fullPath, err := s.resolveWorkspacePath(path, true)
+		if err != nil {
+			return fsResponse{}, err
+		}
+		if err := os.MkdirAll(fullPath, 0o755); err != nil {
+			return fsResponse{}, err
+		}
+		return fsResponse{OK: true, Path: path, Output: "created", Summary: "directory created"}, nil
+	default:
+		return fsResponse{}, errors.New("unsupported_fs_op")
+	}
+}
+
 func (s *server) resolveCWD(value string) (string, error) {
 	if strings.TrimSpace(value) == "" || value == "." {
 		return s.workspace, nil
@@ -332,6 +528,34 @@ func (s *server) resolveCWD(value string) (string, error) {
 	}
 	if info, err := os.Stat(joined); err != nil || !info.IsDir() {
 		return "", errors.New("cwd_not_found")
+	}
+	return joined, nil
+}
+
+func (s *server) resolveWorkspacePath(value string, allowDir bool) (string, error) {
+	clean := cleanDisplayPath(value)
+	if clean == "" || clean == "." {
+		if allowDir {
+			return s.workspace, nil
+		}
+		return "", errors.New("file_path_required")
+	}
+	if filepath.IsAbs(clean) || strings.HasPrefix(clean, "/") {
+		return "", errors.New("absolute_path_not_allowed")
+	}
+	parts := strings.FieldsFunc(clean, func(r rune) bool { return r == '/' || r == '\\' })
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", errors.New("path_traversal_not_allowed")
+		}
+	}
+	joined, err := filepath.Abs(filepath.Join(append([]string{s.workspace}, parts...)...))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(s.workspace, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("path_outside_workspace")
 	}
 	return joined, nil
 }
@@ -407,18 +631,6 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func splitCSV(value string) []string {
-	parts := strings.Split(value, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
 func isSafeEnvKey(key string) bool {
 	if key == "" {
 		return false
@@ -432,6 +644,252 @@ func isSafeEnvKey(key string) bool {
 	return true
 }
 
+func chooseInteractiveMode() (string, string) {
+	if len(os.Args) > 1 || strings.TrimSpace(os.Getenv("XINGKONG_HELPER_NO_MENU")) != "" {
+		return "", ""
+	}
+	fmt.Println("星空 Agent Helper")
+	fmt.Println("当前目录将作为 Agent 工作目录。")
+	fmt.Println()
+	fmt.Println("请选择启动模式：")
+	fmt.Println("1. 配对模式：显示配对 key，打开 NewAPI 后手动输入配对")
+	fmt.Println("2. 主动启动模式：粘贴 NewAPI 网址，自动打开页面、新建 Agent 对话并静默配对")
+	fmt.Print("请输入 1 或 2 后回车（默认 1）：")
+
+	reader := bufio.NewReader(os.Stdin)
+	choice, _ := reader.ReadString('\n')
+	choice = strings.TrimSpace(choice)
+	if choice != "2" {
+		return "pair", ""
+	}
+	for {
+		fmt.Print("请输入 NewAPI 网址后回车：")
+		target, _ := reader.ReadString('\n')
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		return "active", target
+	}
+}
+
+func printStartupInfo(addr, root, pairCode, warning string) {
+	log.Printf("%s %s listening on http://%s", appName, version, addr)
+	log.Printf("workspace: %s", root)
+	log.Printf("CORS: any browser origin is accepted; /v1/exec and /v1/fs require pairing")
+	log.Printf("pairing code: %s", pairCode)
+	fmt.Println()
+	fmt.Printf("工作目录：%s\n", root)
+	fmt.Printf("配对 key：%s\n", pairCode)
+	fmt.Println("保持此窗口打开，网页端 Agent 才能调用本地工具。")
+	if warning != "" {
+		log.Printf("warning: %s", warning)
+		log.Printf("restart example: xingkong-helper.exe --workspace \"D:\\your-project\" --pair-code %s", pairCode)
+	}
+}
+
+func buildActiveLaunchURL(rawURL, pairCode string) string {
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "https://" + rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		parsed.Path = "/playground/"
+	}
+	query := parsed.Query()
+	query.Set("xingkong_agent_mode", "1")
+	query.Set("xingkong_helper_pair_code", pairCode)
+	query.Set("xingkong_helper_autostart", "1")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func openBrowser(target string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start()
+	case "darwin":
+		return exec.Command("open", target).Start()
+	default:
+		return exec.Command("xdg-open", target).Start()
+	}
+}
+
+func cleanDisplayPath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if value == "" {
+		return "."
+	}
+	return strings.TrimPrefix(value, "./")
+}
+
+func listDirectory(fullPath, displayPath string) ([]workspaceEntry, string, error) {
+	items, err := os.ReadDir(fullPath)
+	if err != nil {
+		return nil, "", err
+	}
+	entries := make([]workspaceEntry, 0, len(items))
+	lines := make([]string, 0, len(items))
+	base := cleanDisplayPath(displayPath)
+	if base == "." {
+		base = ""
+	}
+	for _, item := range items {
+		kind := "file"
+		prefix := "file"
+		if item.IsDir() {
+			kind = "directory"
+			prefix = "dir "
+		}
+		entryPath := strings.TrimPrefix(base+"/"+item.Name(), "/")
+		entries = append(entries, workspaceEntry{Name: item.Name(), Path: entryPath, Kind: kind})
+		lines = append(lines, fmt.Sprintf("%s\t%s", prefix, item.Name()))
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Kind != entries[j].Kind {
+			return entries[i].Kind == "directory"
+		}
+		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+	})
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return entries, "(empty directory)", nil
+	}
+	return entries, strings.Join(lines, "\n"), nil
+}
+
+func readTextFile(fullPath string, req fsRequest) (string, string, error) {
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return "", "", err
+	}
+	if info.IsDir() {
+		return "", "", errors.New("path_is_directory")
+	}
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 || maxBytes > maxReadBytes {
+		maxBytes = maxReadBytes
+	}
+	contentBytes, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", "", err
+	}
+	truncatedBytes := false
+	if len(contentBytes) > maxBytes {
+		contentBytes = contentBytes[:maxBytes]
+		truncatedBytes = true
+	}
+	text := string(contentBytes)
+	if req.Whole {
+		if truncatedBytes {
+			text += fmt.Sprintf("\n\n[truncated: %d/%d bytes]", maxBytes, info.Size())
+		}
+		return text, "whole file read", nil
+	}
+	lines := strings.Split(text, "\n")
+	start := req.Start
+	if start <= 0 {
+		start = 1
+	}
+	end := req.End
+	if end <= 0 {
+		end = start + 99
+	}
+	if start > len(lines) {
+		return "", "0 lines read", nil
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	if end < start {
+		end = start
+	}
+	out := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		out = append(out, fmt.Sprintf("%d: %s", i, strings.TrimSuffix(lines[i-1], "\r")))
+	}
+	summary := fmt.Sprintf("lines %d-%d", start, end)
+	if truncatedBytes {
+		out = append(out, "")
+		out = append(out, fmt.Sprintf("[truncated: %d/%d bytes]", maxBytes, info.Size()))
+	} else if end < len(lines) {
+		out = append(out, "")
+		out = append(out, fmt.Sprintf("[truncated: %d/%d lines]", end, len(lines)))
+	}
+	return strings.Join(out, "\n"), summary, nil
+}
+
+func searchWorkspaceFiles(root, displayPath, query string, maxResults int) (string, string, error) {
+	if maxResults <= 0 || maxResults > maxSearchResults {
+		maxResults = 20
+	}
+	queryLower := strings.ToLower(query)
+	results := make([]string, 0, maxResults)
+	scanned := 0
+	base := cleanDisplayPath(displayPath)
+	if base == "." {
+		base = ""
+	}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || len(results) >= maxResults || scanned >= maxSearchFiles {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == "node_modules" || d.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isSearchableFile(d.Name()) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() > searchReadBytes {
+			return nil
+		}
+		scanned++
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		if base != "" {
+			rel = strings.TrimPrefix(base+"/"+rel, "/")
+		}
+		for index, line := range strings.Split(string(content), "\n") {
+			if len(results) >= maxResults {
+				break
+			}
+			if strings.Contains(strings.ToLower(line), queryLower) {
+				results = append(results, fmt.Sprintf("%s:%d: %s", rel, index+1, strings.TrimSpace(line)))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if len(results) == 0 {
+		return "no matches", fmt.Sprintf("0 matches in %d scanned files", scanned), nil
+	}
+	return strings.Join(results, "\n"), fmt.Sprintf("%d matches in %d scanned files", len(results), scanned), nil
+}
+
+func isSearchableFile(name string) bool {
+	lower := strings.ToLower(name)
+	exts := []string{".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".java", ".c", ".cpp", ".h", ".hpp", ".rs", ".sh", ".sql", ".log", ".toml", ".ini", ".env"}
+	for _, ext := range exts {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
 func truncateOutput(value string, maxBytes int) (string, bool) {
 	if len(value) <= maxBytes {
 		return value, false
@@ -440,10 +898,8 @@ func truncateOutput(value string, maxBytes int) (string, bool) {
 }
 
 func defaultWorkspace() string {
-	if runtime.GOOS == "windows" {
-		if exe, err := os.Executable(); err == nil {
-			return filepath.Dir(exe)
-		}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
 	}
 	return "."
 }
